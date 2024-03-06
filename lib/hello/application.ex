@@ -9,7 +9,7 @@ defmodule Hello.Application do
   def start(_type, _args) do
     children = [
       HelloWeb.Telemetry,
-      Hello.Repo,
+      #Hello.Repo,
       {DNSCluster, query: Application.get_env(:hello, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Hello.PubSub},
       # Start the Finch HTTP client for sending emails
