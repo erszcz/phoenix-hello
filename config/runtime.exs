@@ -115,3 +115,6 @@ if config_env() == :prod do
   #
   # See https://hexdocs.pm/swoosh/Swoosh.html#module-installation for details.
 end
+
+config :hello, HelloWeb.PageController,
+  name_to_greet: System.get_env("HELLO_NAME_TO_GREET", "world")
