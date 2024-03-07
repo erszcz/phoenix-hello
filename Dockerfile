@@ -1,66 +1,97 @@
-ARG ELIXIR_VERSION=1.15.2
-ARG OTP_VERSION=25.3.2.3
-ARG ALPINE_VERSION=3.16.6
+# Find eligible builder and runner images on Docker Hub. We use Ubuntu/Debian
+# instead of Alpine to avoid DNS resolution issues in production.
+#
+# https://hub.docker.com/r/hexpm/elixir/tags?page=1&name=ubuntu
+# https://hub.docker.com/_/ubuntu?tab=tags
+#
+# This file is based on these images:
+#
+#   - https://hub.docker.com/r/hexpm/elixir/tags - for the build image
+#   - https://hub.docker.com/_/debian?tab=tags&page=1&name=bullseye-20230522-slim - for the release image
+#   - https://pkgs.org/ - resource for finding needed packages
+#   - Ex: hexpm/elixir:1.15.0-erlang-25.3.2-debian-bullseye-20230522-slim
+#
+ARG ELIXIR_VERSION=1.15.0
+ARG OTP_VERSION=25.3.2
+ARG DEBIAN_VERSION=bullseye-20230522-slim
 
-ARG BUILDER_IMAGE=hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-alpine-${ALPINE_VERSION}
-ARG RUNNER_IMAGE=alpine:${ALPINE_VERSION}
+ARG BUILDER_IMAGE="hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-debian-${DEBIAN_VERSION}"
+ARG RUNNER_IMAGE="debian:${DEBIAN_VERSION}"
 
-FROM ${BUILDER_IMAGE} AS builder
+FROM ${BUILDER_IMAGE} as builder
 
-# ssh
-RUN apk upgrade --no-cache && apk add --no-cache --update build-base git openssh-client
-RUN mkdir -p -m 0600 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+# install build dependencies
+RUN apt-get update -y && apt-get install -y build-essential git \
+    && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
-# Always set the env to prod
-ENV MIX_ENV=prod
+# prepare build dir
+WORKDIR /app
 
-# The following are build arguments used to change variable parts of the image.
-# The name of your application/release (required)
-ARG APP_NAME
+# install hex + rebar
+RUN mix local.hex --force && \
+    mix local.rebar --force
 
-# By convention, /opt is typically used for applications
-WORKDIR /opt/app
+# set build ENV
+ENV MIX_ENV="prod"
 
-# This step installs all the build tools we'll need
-RUN mix local.rebar --force && \
-  mix local.hex --force
+# install mix dependencies
+COPY mix.exs mix.lock ./
+RUN mix deps.get --only $MIX_ENV
+RUN mkdir config
 
-# Cache the dependency fetching
-COPY mix.exs mix.exs
+# copy compile-time config files before we compile dependencies
+# to ensure any relevant config change will trigger the dependencies
+# to be re-compiled.
+COPY config/config.exs config/${MIX_ENV}.exs config/
+RUN mix deps.compile
 
-# Cache the dependency fetching
-#COPY mix.lock mix.lock
+COPY priv priv
 
-COPY config config
+COPY lib lib
 
-RUN --mount=type=ssh mix do deps.get --only $MIX_ENV, deps.compile
+COPY assets assets
 
-COPY apps apps
+# compile assets
+RUN mix assets.deploy
 
-RUN MIX_ENV=prod mix compile
+# Compile the release
+RUN mix compile
 
-ARG APP_VSN
+# Changes to config/runtime.exs don't require recompiling the code
+COPY config/runtime.exs config/
 
-ENV APP_VSN=${APP_VSN}
+COPY rel rel
+RUN mix release
 
-RUN mix release ${APP_NAME}
+# start a new build stage so that the final image will only contain
+# the compiled release and other runtime necessities
+FROM ${RUNNER_IMAGE}
 
-# From this line onwards, we're in a new image, which will be the image used in production
-FROM ${RUNNER_IMAGE} AS final
-RUN apk upgrade --no-cache && \ 
-  apk add --no-cache bash openssl libgcc libstdc++ ncurses-libs
+RUN apt-get update -y && \
+  apt-get install -y libstdc++6 openssl libncurses5 locales ca-certificates \
+  && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
-ARG APP_NAME
+# Set the locale
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
-WORKDIR /opt/app
+ENV LANG en_US.UTF-8
+ENV LANGUAGE en_US:en
+ENV LC_ALL en_US.UTF-8
 
-COPY --from=builder /opt/app/_build/prod/rel/${APP_NAME}*  .
+WORKDIR "/app"
+RUN chown nobody /app
 
-RUN find /opt/app -type f -perm +0100 -exec chmod 555 {} \;
+# set runner ENV
+ENV MIX_ENV="prod"
 
-RUN cp ./bin/${APP_NAME} ./bin/release
+# Only copy the final release from the build stage
+COPY --from=builder --chown=nobody:root /app/_build/${MIX_ENV}/rel/hello ./
 
-ENTRYPOINT  ["./bin/release"]
+USER nobody
 
-CMD ["start"]
+# If using an environment that doesn't automatically reap zombie processes, it is
+# advised to add an init process such as tini via `apt-get install`
+# above and adding an entrypoint. See https://github.com/krallin/tini for details
+# ENTRYPOINT ["/tini", "--"]
 
+CMD ["/app/bin/server"]
